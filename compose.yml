@@ -1,0 +1,99 @@
+# 箱に1台の共有 llama.cpp（llama-server）。公式イメージ ghcr.io/ggml-org/llama.cpp の server 版、版は .env の LLAMA_CPP_TAG。
+# llama-server は1プロセス1モデルが基本なので、埋め込み用（embed）と小型 LLM 用（llm）の2本を立てる。
+# 3本目（mcp）は、llm の OpenAI 互換の口を MCP の道具 1 個にして出す橋渡し（既存の公開パッケージを bunx で起こす。自作しない）。
+# ほかの compose プロジェクトは external network `llama-cpp` に参加して、ホスト名 `llama-embed`／`llama-llm` の 8080 番に繋ぐ
+# （OpenAI 互換の口は http://llama-embed:8080/v1、http://llama-llm:8080/v1）。ホスト側からは 127.0.0.1 だけ（外には開けない）。
+# モデルは llama-server の -hf で Hugging Face から落とし、名前付きボリューム models（コンテナ内 /models＝LLAMA_CACHE）に残す。
+name: llama-cpp
+
+x-llama: &llama
+  image: ghcr.io/ggml-org/llama.cpp:${LLAMA_CPP_TAG:-server-b11681}   # arm64 あり。2026-10-16 時点で :server と同じ中身（build 11681）
+  restart: unless-stopped
+  environment:
+    LLAMA_CACHE: /models        # -hf が落とす先（既定は ~/.cache/llama.cpp）
+  volumes:
+    - models:/models            # 落とした GGUF（llama-cpp_models）。down に -v を付けなければ残る
+
+services:
+  # 埋め込み。embeddinggemma 300m の QAT Q8_0（ollama の embeddinggemma:300m-qat-q8_0 と同じ元のチェックポイント）。
+  # 接頭辞は呼ぶ側（Hindsight など）が付ける：問い "task: search result | query: "、文書 "title: none | text: "
+  embed:
+    <<: *llama
+    container_name: llama-embed
+    ports:
+      - "127.0.0.1:${LLAMA_EMBED_PORT:-8081}:8080"
+    command:
+      - -hf
+      - ${LLAMA_EMBED_HF:-ggml-org/embeddinggemma-300m-qat-q8_0-GGUF}
+      - --alias
+      - ${LLAMA_EMBED_ALIAS:-embeddinggemma}      # /v1/embeddings の "model" に書く名前（/v1/models にもこの名で出る）
+      - --embeddings
+      - --pooling
+      - ${LLAMA_EMBED_POOLING:-mean}              # embeddinggemma のカードは mean pooling
+      - --ctx-size
+      - "4096"                                    # スロット2つで割るので1スロット 2048（embeddinggemma の最大入力）
+      - --batch-size
+      - "2048"
+      - --ubatch-size
+      - "2048"                                    # 埋め込み（非因果）は1入力が1マイクロバッチに収まる必要がある
+      - --parallel
+      - "2"
+      - --threads
+      - ${LLAMA_THREADS:-2}
+      - --no-webui
+    mem_limit: ${LLAMA_EMBED_MEM_LIMIT:-1g}
+
+  # 小型 LLM（thinking は切る）。本命は Qwen3 1.7B の Q4_K_M、速さ優先なら .env で Qwen3.5 0.8B の Q8_0 に替える（README）。
+  llm:
+    <<: *llama
+    container_name: llama-llm
+    ports:
+      - "127.0.0.1:${LLAMA_LLM_PORT:-8082}:8080"
+    command:
+      - -hf
+      - ${LLAMA_LLM_HF:-ggml-org/Qwen3-1.7B-GGUF:Q4_K_M}
+      - --alias
+      - ${LLAMA_LLM_ALIAS:-qwen3-1.7b}
+      - --ctx-size
+      - ${LLAMA_LLM_CTX:-4096}                    # 既定（モデルの 40960）だと KV キャッシュだけで数 GB になる
+      - --parallel
+      - "1"
+      - --threads
+      - ${LLAMA_THREADS:-2}
+      - --reasoning
+      - ${LLAMA_LLM_REASONING:-off}               # thinking を切る（2 vCPU だと考え続けて答えが出ない。README の計測）
+      - --no-webui
+    mem_limit: ${LLAMA_LLM_MEM_LIMIT:-3g}
+
+  # MCP の橋渡し。@pyroprompts/any-chat-completions-mcp（stdio、道具は chat-with-<AI_CHAT_NAME> の1個）を
+  # mcp-proxy で streamable HTTP にする。Claude Code からは http://127.0.0.1:8083/mcp
+  mcp:
+    image: oven/bun:${BUN_VERSION:-1.4.3-alpine}  # arm64 あり
+    container_name: llama-mcp
+    restart: unless-stopped
+    depends_on: [llm]
+    ports:
+      - "127.0.0.1:${LLAMA_MCP_PORT:-8083}:8080"
+    environment:
+      AI_CHAT_BASE_URL: http://llm:8080/v1
+      AI_CHAT_KEY: none                           # llama-server は鍵を見ない（空だと橋渡しが起動を拒むので埋め草）
+      AI_CHAT_MODEL: ${LLAMA_LLM_ALIAS:-qwen3-1.7b}
+      AI_CHAT_NAME: ${LLAMA_MCP_NAME:-local-llm}  # 道具の名前が chat-with-local-llm になる
+      AI_CHAT_TIMEOUT: ${LLAMA_MCP_TIMEOUT:-300000}   # ms。2 vCPU の生成は1問で数秒〜数十秒
+      AI_CHAT_SYSTEM_PROMPT: ${LLAMA_MCP_SYSTEM_PROMPT:-}
+    # --server stream: streamable HTTP だけ（旧い SSE の口は開けない）。--host 0.0.0.0: コンテナ内で全 IF（外へは ports の 127.0.0.1 だけ）
+    # bunx --bun: 橋渡しの cli が node を spawn するので、bun を node として見せる
+    command: ["bunx", "mcp-proxy@${MCP_PROXY_VERSION:-6.7.20}", "--host", "0.0.0.0", "--port", "8080", "--server", "stream", "--",
+              "bunx", "--bun", "@pyroprompts/any-chat-completions-mcp@${ANY_CHAT_MCP_VERSION:-0.1.1}"]
+    volumes:
+      - bun_cache:/root/.bun    # bunx が落としたパッケージ。再起動のたびに落とし直さない
+    mem_limit: ${LLAMA_MCP_MEM_LIMIT:-512m}
+
+networks:
+  default:
+    # 固定名。ほかのプロジェクトから `external: true` で参照する
+    name: llama-cpp
+
+volumes:
+  models:
+  bun_cache:
