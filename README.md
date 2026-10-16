@@ -1,5 +1,7 @@
 # llama-cpp-docker
 
+> **2026-10-16 に ollama（[ollama-docker](https://github.com/takano32/ollama-docker)）へ戻したので、いまは使っていない。**同じ夜に llama-server 2本へ替えて測ったあと、埋め込みと LLM を1つの口で扱える手軽さを取って ollama に戻した。計測の数字と構成は記録として残す。箱からはイメージとボリュームを消してある（`docker compose up -d` すれば落とし直して動く）。
+
 箱に1台の共有 [llama.cpp](https://github.com/ggml-org/llama.cpp)（`llama-server`）。公式イメージ `ghcr.io/ggml-org/llama.cpp` の server 版を、
 埋め込み用と小型 LLM 用の2本で動かし、3本目に MCP の橋渡しを置く。ollama（[ollama-docker](https://github.com/takano32/ollama-docker)）の置き換え。
 本家リポジトリは fork も改変もしない。版は `.env` の `LLAMA_CPP_TAG`（既定 `server-b11681`＝2026-10-16 時点の `:server` と同じ中身、`llama-server --version` は `0.7.0-dev (build 11681)`）。
